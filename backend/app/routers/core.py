@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Body, HTTPException
 
 from app.db import connect
+from app.modules import drop_pickup_bond_proof as bond_proof
 from app.seed import overdue_hours
 from app.services import bay as bay_svc
 from app.services import ingest as ingest_svc
@@ -75,6 +76,43 @@ def occupancy_proofs():
             "SELECT * FROM occupancy_proofs ORDER BY id DESC LIMIT 50"
         ).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+@router.get("/bond-proofs")
+def bond_proofs():
+    """核证页数据源：每个占用一行，含 drop/pickup 两端事件与异常标记。"""
+    conn = connect()
+    try:
+        return bond_proof.bond_proofs(conn)
+    finally:
+        conn.close()
+
+
+@router.get("/occupancy-bonds")
+def occupancy_bonds():
+    conn = connect()
+    try:
+        return bond_proof.list_bonds(conn)
+    finally:
+        conn.close()
+
+
+@router.get("/occupancy-bonds/{occupancy_id}")
+def occupancy_bond(occupancy_id: str):
+    """按占用查绑定边两端事件；已释放却无绑定边说明账不平。"""
+    conn = connect()
+    try:
+        found = bond_proof.bond_for_occupancy(conn, occupancy_id)
+        if found is None:
+            raise HTTPException(404, f"占用 {occupancy_id} 不存在")
+        if found["bond"] is None:
+            if found["occupancy"]["status"] == "released":
+                raise HTTPException(409, f"占用 {occupancy_id} 已释放但无绑定边，账不平")
+            found["expected"] = "closed_on_pickup"
+            found["reason"] = "占用尚未取件关账，暂无绑定边"
+        return found
     finally:
         conn.close()
 

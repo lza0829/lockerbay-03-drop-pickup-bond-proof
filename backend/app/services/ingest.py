@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from app.db import FIXTURES_DIR, connect
+from app.modules import drop_pickup_bond_proof as bond_proof
 
 
 def run_batch():
@@ -15,9 +16,13 @@ def run_batch():
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     conn = connect()
     accepted = 0
+    bonded = 0
+    rejected_closes = []
     try:
-        for ev in events:
-            conn.execute(
+        # 整批一个事务；单条 pickups 关账用 savepoint 隔离，失败只回滚该条并搁置。
+        conn.execute("BEGIN IMMEDIATE")
+        for ev in sorted(events, key=lambda e: (e["event_ts"], e["id"])):
+            cur = conn.execute(
                 "INSERT OR IGNORE INTO parcel_events(id, cabinet_id, cell_id, event_type, event_ts, tracking_no, payload_json, channel) VALUES (?,?,?,?,?,?,?,?)",
                 (
                     ev["id"],
@@ -30,10 +35,16 @@ def run_batch():
                     "primary",
                 ),
             )
-            if conn.total_changes:
+            inserted = cur.rowcount == 1
+            if inserted:
                 accepted += 1
+            if not inserted:
+                # 重复事件不重复物化；关账结果已在首次入库时定案。
+                continue
             if ev["event_type"] == "drop" and ev.get("cell_id"):
-                cell = conn.execute("SELECT status FROM cells WHERE id=?", (ev["cell_id"],)).fetchone()
+                cell = conn.execute(
+                    "SELECT status FROM cells WHERE id=?", (ev["cell_id"],)
+                ).fetchone()
                 if cell and cell["status"] == "free":
                     oid = f"OCC-{ev['cell_id']}-{ev['id']}"
                     conn.execute(
@@ -42,21 +53,30 @@ def run_batch():
                     )
                     conn.execute("UPDATE cells SET status='occupied' WHERE id=?", (ev["cell_id"],))
             elif ev["event_type"] == "pickup" and ev.get("cell_id"):
-                row = conn.execute(
-                    "SELECT id FROM occupancies WHERE cell_id=? AND status='occupied' ORDER BY opened_at DESC LIMIT 1",
-                    (ev["cell_id"],),
-                ).fetchone()
-                if row:
-                    conn.execute(
-                        "UPDATE occupancies SET closed_at=?, status='released', last_event_id=? WHERE id=?",
-                        (ev["event_ts"], ev["id"], row["id"]),
+                outcome = bond_proof.try_close_pickup(conn, ev, now)
+                if outcome["status"] == "closed":
+                    bonded += 1
+                else:
+                    rejected_closes.append(
+                        {
+                            "pickup_event_id": outcome["pickup_event_id"],
+                            "reason": outcome["reason"],
+                        }
                     )
-                    conn.execute("UPDATE cells SET status='free' WHERE id=?", (ev["cell_id"],))
+        report = {
+            "accepted": accepted,
+            "total": len(events),
+            "bonded": bonded,
+            "rejected_closes": rejected_closes,
+        }
         conn.execute(
             "INSERT INTO ingest_batches(id, created_at, report_json) VALUES (?,?,?)",
-            (batch_id, now, json.dumps({"accepted": accepted, "total": len(events)}, ensure_ascii=False)),
+            (batch_id, now, json.dumps(report, ensure_ascii=False)),
         )
         conn.commit()
-        return {"batch_id": batch_id, "accepted": accepted, "total": len(events)}
+        return {"batch_id": batch_id, **report}
+    except BaseException:
+        conn.rollback()
+        raise
     finally:
         conn.close()

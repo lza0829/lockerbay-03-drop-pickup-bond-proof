@@ -15,6 +15,9 @@ export const api = {
   events: () => req('/api/events'),
   quarantine: () => req('/api/quarantine'),
   proofs: () => req('/api/occupancy-proofs'),
+  bondProofs: () => req('/api/bond-proofs'),
+  occupancyBonds: () => req('/api/occupancy-bonds'),
+  bondFor: (occupancyId) => req(`/api/occupancy-bonds/${encodeURIComponent(occupancyId)}`),
   settings: () => req('/api/settings'),
   setOverdue: (overdue_hours) =>
     req('/api/settings/overdue-hours', { method: 'PUT', body: JSON.stringify({ overdue_hours }) }),

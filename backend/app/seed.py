@@ -2,6 +2,7 @@ import json
 from datetime import datetime, timezone
 
 from app.db import FIXTURES_DIR, connect
+from app.modules import drop_pickup_bond_proof as bond_proof
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
@@ -79,10 +80,12 @@ def overdue_hours(conn) -> int:
 def init_db():
     conn = connect()
     conn.executescript(SCHEMA)
+    conn.executescript(bond_proof.SCHEMA_SQL)
     if not conn.execute("SELECT 1 FROM settings WHERE key='overdue_hours'").fetchone():
         conn.execute("INSERT INTO settings(key, value) VALUES ('overdue_hours', '48')")
     if conn.execute("SELECT COUNT(*) AS c FROM cabinets").fetchone()["c"] == 0:
         _seed(conn)
+    bond_proof.backfill_bonds(conn)
     conn.commit()
     conn.close()
 
@@ -136,13 +139,5 @@ def _seed(conn):
                 ),
             )
         elif ev["event_type"] == "pickup" and ev.get("cell_id"):
-            row = conn.execute(
-                "SELECT id FROM occupancies WHERE cell_id=? AND status='occupied' ORDER BY opened_at DESC LIMIT 1",
-                (ev["cell_id"],),
-            ).fetchone()
-            if row:
-                conn.execute(
-                    "UPDATE occupancies SET closed_at=?, status='released', last_event_id=? WHERE id=?",
-                    (ev["event_ts"], ev["id"], row["id"]),
-                )
-                conn.execute("UPDATE cells SET status='free' WHERE id=?", (ev["cell_id"],))
+            # 取件关账必须物化 drop↔pickup 绑定边；缺 drop 侧则拒关账并搁置。
+            bond_proof.try_close_pickup(conn, ev)
